@@ -1,0 +1,35 @@
+{
+  "name": "dataapi-desktop-sdk",
+  "version": "0.1.0",
+  "description": "DataAPI Desktop SDK based on Tauri",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "dataapi",
+    "sdk",
+    "desktop",
+    "tauri"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.4.0",
+    "typescript": "^5.0.4"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.6.0"
+  }
+}
