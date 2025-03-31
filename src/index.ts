@@ -1,88 +1,183 @@
-import * as api from './api';
-import { initConfig, SdkConfig } from './core/config';
-import { EventSystem } from './core/events';
-import { Store } from './core/store';
-import { UserManager } from './core/user';
+import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import { AuthModule } from './modules/auth';
+import { StorageModule } from './modules/storage';
+import { DatabaseModule } from './modules/database';
+import { GatewayModule } from './modules/gateway';
+import { PluginModule } from './modules/plugin';
+import { KnowledgeModule } from './modules/knowledge';
+import { WorkflowModule } from './modules/workflow';
 
 /**
- * DataAPI SDK 主类
+ * SDK配置选项
  */
-export class DataApiSDK {
-  public api = api;
-  public events = new EventSystem();
-  public store = new Store();
-  public user: UserManager;
-  
-  private static instance: DataApiSDK | null = null;
-  private initialized = false;
-  
-  /**
-   * 创建 SDK 实例
-   * @param config SDK 配置
-   */
-  constructor(config: Partial<SdkConfig> = {}) {
-    initConfig(config);
-    this.user = new UserManager();
-  }
-  
-  /**
-   * 获取 SDK 单例实例
-   * @param config SDK 配置
-   * @returns SDK 实例
-   */
-  public static getInstance(config?: Partial<SdkConfig>): DataApiSDK {
-    if (!DataApiSDK.instance) {
-      DataApiSDK.instance = new DataApiSDK(config);
-    } else if (config) {
-      // 如果已经有实例但又传入了配置，则更新配置
-      initConfig(config);
-    }
-    
-    return DataApiSDK.instance;
-  }
-  
-  /**
-   * 初始化 SDK
-   * @returns SDK 实例
-   */
-  async init(): Promise<DataApiSDK> {
-    if (this.initialized) {
-      console.warn('DataAPI SDK 已经初始化');
-      return this;
-    }
-    
-    // 初始化逻辑
-    await this.user.restoreSession();
-    
-    this.initialized = true;
-    console.log('DataAPI SDK 初始化完成');
-    this.events.emit('sdk:ready');
-    return this;
-  }
-  
-  /**
-   * 连接到后端服务
-   */
-  async connect(options: { url?: string, token?: string } = {}): Promise<DataApiSDK> {
-    // 连接逻辑
-    this.events.emit('sdk:connected');
-    return this;
-  }
-  
-  /**
-   * 断开连接
-   */
-  async disconnect(): Promise<void> {
-    // 断开连接逻辑
-    this.events.emit('sdk:disconnected');
-  }
+export interface DataAPIClientOptions extends AxiosRequestConfig {
+  /** API基础URL */
+  baseURL: string;
+  /** 请求超时时间（毫秒） */
+  timeout?: number;
+  /** 是否自动刷新令牌 */
+  autoRefreshToken?: boolean;
+  /** 是否在浏览器环境中使用localStorage存储令牌 */
+  useLocalStorage?: boolean;
+  /** 自定义令牌存储键名 */
+  tokenStorageKey?: string;
+  /** 自定义刷新令牌存储键名 */
+  refreshTokenStorageKey?: string;
 }
 
-// 导出类型和API
-export * from './api';
-export * from './core/user';
-export * from './core/config';
+/**
+ * DataAPI客户端类
+ * SDK的主入口，整合所有功能模块
+ */
+export class DataAPIClient {
+  /** HTTP客户端 */
+  private readonly httpClient: AxiosInstance;
+  /** 配置选项 */
+  private readonly options: DataAPIClientOptions;
 
-// 创建默认实例
-const dataapi = DataApiSDK.getInstance();
-export default dataapi;
+  /** 用户认证模块 */
+  public readonly auth: AuthModule;
+  /** 存储管理模块 */
+  public readonly storage: StorageModule;
+  /** 数据库管理模块 */
+  public readonly database: DatabaseModule;
+  /** 网关管理模块 */
+  public readonly gateway: GatewayModule;
+  /** 插件管理模块 */
+  public readonly plugin: PluginModule;
+  /** 知识库管理模块 */
+  public readonly knowledge: KnowledgeModule;
+  /** 流程管理模块 */
+  public readonly workflow: WorkflowModule;
+
+  /**
+   * 创建DataAPI客户端实例
+   * @param options 配置选项
+   */
+  constructor(options: DataAPIClientOptions) {
+    this.options = {
+      timeout: 30000,
+      autoRefreshToken: true,
+      useLocalStorage: typeof window !== 'undefined',
+      tokenStorageKey: 'dataapi_access_token',
+      refreshTokenStorageKey: 'dataapi_refresh_token',
+      ...options
+    };
+
+    // 创建Axios实例
+    this.httpClient = axios.create(this.options);
+
+    // 配置请求拦截器，添加认证头
+    this.httpClient.interceptors.request.use((config) => {
+      const token = this.getAccessToken();
+      if (token) {
+        config.headers = config.headers || {};
+        config.headers['Authorization'] = `Bearer ${token}`;
+      }
+      return config;
+    });
+
+    // 配置响应拦截器，处理令牌刷新
+    this.httpClient.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const originalRequest = error.config;
+        
+        // 如果是401错误且启用了自动刷新令牌，且不是刷新令牌请求本身
+        if (
+          error.response?.status === 401 &&
+          this.options.autoRefreshToken &&
+          !originalRequest._isRetry &&
+          !originalRequest.url?.includes('/auth/refresh')
+        ) {
+          originalRequest._isRetry = true;
+          
+          try {
+            // 尝试刷新令牌
+            const refreshToken = this.getRefreshToken();
+            if (!refreshToken) {
+              throw new Error('No refresh token available');
+            }
+            
+            const response = await this.auth.refreshToken(refreshToken);
+            
+            // 保存新令牌
+            this.setAccessToken(response.accessToken);
+            this.setRefreshToken(response.refreshToken);
+            
+            // 重试原始请求
+            originalRequest.headers['Authorization'] = `Bearer ${response.accessToken}`;
+            return this.httpClient(originalRequest);
+          } catch (refreshError) {
+            // 刷新令牌失败，清除令牌并返回原始错误
+            this.clearTokens();
+            return Promise.reject(error);
+          }
+        }
+        
+        return Promise.reject(error);
+      }
+    );
+
+    // 初始化各功能模块
+    this.auth = new AuthModule(this.httpClient);
+    this.storage = new StorageModule(this.httpClient);
+    this.database = new DatabaseModule(this.httpClient);
+    this.gateway = new GatewayModule(this.httpClient);
+    this.plugin = new PluginModule(this.httpClient);
+    this.knowledge = new KnowledgeModule(this.httpClient);
+    this.workflow = new WorkflowModule(this.httpClient);
+  }
+
+  /**
+   * 获取访问令牌
+   * @returns 访问令牌
+   */
+  private getAccessToken(): string | null {
+    if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+      return localStorage.getItem(this.options.tokenStorageKey!);
+    }
+    return null;
+  }
+
+  /**
+   * 设置访问令牌
+   * @param token 访问令牌
+   */
+  private setAccessToken(token: string): void {
+    if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+      localStorage.setItem(this.options.tokenStorageKey!, token);
+    }
+  }
+
+  /**
+   * 获取刷新令牌
+   * @returns 刷新令牌
+   */
+  private getRefreshToken(): string | null {
+    if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+      return localStorage.getItem(this.options.refreshTokenStorageKey!);
+    }
+    return null;
+  }
+
+  /**
+   * 设置刷新令牌
+   * @param token 刷新令牌
+   */
+  private setRefreshToken(token: string): void {
+    if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+      localStorage.setItem(this.options.refreshTokenStorageKey!, token);
+    }
+  }
+
+  /**
+   * 清除所有令牌
+   */
+  private clearTokens(): void {
+    if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+      localStorage.removeItem(this.options.tokenStorageKey!);
+      localStorage.removeItem(this.options.refreshTokenStorageKey!);
+    }
+  }
+}

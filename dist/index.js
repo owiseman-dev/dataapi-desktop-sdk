@@ -1,76 +1,133 @@
-import * as api from './api';
-import { initConfig } from './core/config';
-import { EventSystem } from './core/events';
-import { Store } from './core/store';
-import { UserManager } from './core/user';
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DataAPIClient = void 0;
+const axios_1 = __importDefault(require("axios"));
+const auth_1 = require("./modules/auth");
+const storage_1 = require("./modules/storage");
+const database_1 = require("./modules/database");
+const gateway_1 = require("./modules/gateway");
+const plugin_1 = require("./modules/plugin");
+const knowledge_1 = require("./modules/knowledge");
+const workflow_1 = require("./modules/workflow");
 /**
- * DataAPI SDK 主类
+ * DataAPI客户端类
+ * SDK的主入口，整合所有功能模块
  */
-export class DataApiSDK {
+class DataAPIClient {
     /**
-     * 创建 SDK 实例
-     * @param config SDK 配置
+     * 创建DataAPI客户端实例
+     * @param options 配置选项
      */
-    constructor(config = {}) {
-        this.api = api;
-        this.events = new EventSystem();
-        this.store = new Store();
-        this.initialized = false;
-        initConfig(config);
-        this.user = new UserManager();
+    constructor(options) {
+        this.options = {
+            timeout: 30000,
+            autoRefreshToken: true,
+            useLocalStorage: typeof window !== 'undefined',
+            tokenStorageKey: 'dataapi_access_token',
+            refreshTokenStorageKey: 'dataapi_refresh_token',
+            ...options
+        };
+        // 创建Axios实例
+        this.httpClient = axios_1.default.create(this.options);
+        // 配置请求拦截器，添加认证头
+        this.httpClient.interceptors.request.use((config) => {
+            const token = this.getAccessToken();
+            if (token) {
+                config.headers = config.headers || {};
+                config.headers['Authorization'] = `Bearer ${token}`;
+            }
+            return config;
+        });
+        // 配置响应拦截器，处理令牌刷新
+        this.httpClient.interceptors.response.use((response) => response, async (error) => {
+            const originalRequest = error.config;
+            // 如果是401错误且启用了自动刷新令牌，且不是刷新令牌请求本身
+            if (error.response?.status === 401 &&
+                this.options.autoRefreshToken &&
+                !originalRequest._isRetry &&
+                !originalRequest.url?.includes('/auth/refresh')) {
+                originalRequest._isRetry = true;
+                try {
+                    // 尝试刷新令牌
+                    const refreshToken = this.getRefreshToken();
+                    if (!refreshToken) {
+                        throw new Error('No refresh token available');
+                    }
+                    const response = await this.auth.refreshToken(refreshToken);
+                    // 保存新令牌
+                    this.setAccessToken(response.accessToken);
+                    this.setRefreshToken(response.refreshToken);
+                    // 重试原始请求
+                    originalRequest.headers['Authorization'] = `Bearer ${response.accessToken}`;
+                    return this.httpClient(originalRequest);
+                }
+                catch (refreshError) {
+                    // 刷新令牌失败，清除令牌并返回原始错误
+                    this.clearTokens();
+                    return Promise.reject(error);
+                }
+            }
+            return Promise.reject(error);
+        });
+        // 初始化各功能模块
+        this.auth = new auth_1.AuthModule(this.httpClient);
+        this.storage = new storage_1.StorageModule(this.httpClient);
+        this.database = new database_1.DatabaseModule(this.httpClient);
+        this.gateway = new gateway_1.GatewayModule(this.httpClient);
+        this.plugin = new plugin_1.PluginModule(this.httpClient);
+        this.knowledge = new knowledge_1.KnowledgeModule(this.httpClient);
+        this.workflow = new workflow_1.WorkflowModule(this.httpClient);
     }
     /**
-     * 获取 SDK 单例实例
-     * @param config SDK 配置
-     * @returns SDK 实例
+     * 获取访问令牌
+     * @returns 访问令牌
      */
-    static getInstance(config) {
-        if (!DataApiSDK.instance) {
-            DataApiSDK.instance = new DataApiSDK(config);
+    getAccessToken() {
+        if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+            return localStorage.getItem(this.options.tokenStorageKey);
         }
-        else if (config) {
-            // 如果已经有实例但又传入了配置，则更新配置
-            initConfig(config);
+        return null;
+    }
+    /**
+     * 设置访问令牌
+     * @param token 访问令牌
+     */
+    setAccessToken(token) {
+        if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+            localStorage.setItem(this.options.tokenStorageKey, token);
         }
-        return DataApiSDK.instance;
     }
     /**
-     * 初始化 SDK
-     * @returns SDK 实例
+     * 获取刷新令牌
+     * @returns 刷新令牌
      */
-    async init() {
-        if (this.initialized) {
-            console.warn('DataAPI SDK 已经初始化');
-            return this;
+    getRefreshToken() {
+        if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+            return localStorage.getItem(this.options.refreshTokenStorageKey);
         }
-        // 初始化逻辑
-        await this.user.restoreSession();
-        this.initialized = true;
-        console.log('DataAPI SDK 初始化完成');
-        this.events.emit('sdk:ready');
-        return this;
+        return null;
     }
     /**
-     * 连接到后端服务
+     * 设置刷新令牌
+     * @param token 刷新令牌
      */
-    async connect(options = {}) {
-        // 连接逻辑
-        this.events.emit('sdk:connected');
-        return this;
+    setRefreshToken(token) {
+        if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+            localStorage.setItem(this.options.refreshTokenStorageKey, token);
+        }
     }
     /**
-     * 断开连接
+     * 清除所有令牌
      */
-    async disconnect() {
-        // 断开连接逻辑
-        this.events.emit('sdk:disconnected');
+    clearTokens() {
+        if (this.options.useLocalStorage && typeof localStorage !== 'undefined') {
+            localStorage.removeItem(this.options.tokenStorageKey);
+            localStorage.removeItem(this.options.refreshTokenStorageKey);
+        }
     }
 }
-DataApiSDK.instance = null;
-// 导出类型和API
-export * from './api';
-export * from './core/user';
-export * from './core/config';
-// 创建默认实例
-const dataapi = DataApiSDK.getInstance();
-export default dataapi;
+exports.DataAPIClient = DataAPIClient;
+//# sourceMappingURL=index.js.map
